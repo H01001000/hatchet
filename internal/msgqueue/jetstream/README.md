@@ -1,125 +1,164 @@
-# JetStream durable queue backend — stage 1
+# JetStream message queue backend
 
-This package implements Hatchet's existing `msgqueue.MessageQueue` interface for
-ordinary durable queues. It follows `internal/msgqueue/rabbitmq/rabbitmq.go` in
-its constructor, option names, publication/subscription methods and acknowledgment
-hooks so the two backends can be reviewed side by side.
-
-This first stage is a library and test boundary. It is **not registered as a
-`SERVER_MSGQUEUE_KIND`** yet. A full engine switch requires dispatcher ownership
-and expiry/rerouting support in the next stage. Existing backends and defaults
+This package implements Hatchet's `msgqueue.MessageQueue` interface and is
+selectable with `SERVER_MSGQUEUE_KIND=jetstream`. Constructors, options, method
+names, compression and acknowledgment hooks follow the RabbitMQ backend so the
+implementations can be reviewed side by side. Engine callers and SDK contracts
 are unchanged.
 
-## Behavior and RabbitMQ mapping
+## RabbitMQ contract mapping
 
 | RabbitMQ backend | JetStream backend |
 | --- | --- |
-| Durable named queue | File-backed WorkQueue stream per queue |
-| Competing queue consumers | Shared durable `workers` consumer per stream |
-| `SendMessage` | Synchronous publication, returns after PubAck |
+| Named durable queue | File-backed WorkQueue stream per queue |
+| Non-durable queue | Memory-backed stream |
+| Competing consumers | Shared durable pull consumer |
+| Exclusive dispatcher queue | Renewed KV ownership and a consumer per ownership generation |
 | `preAck → ACK → postAck` | `preAck → confirmed ACK → postAck` |
-| Retry through delayed DLQ | Delayed NAK/redelivery on the same consumer |
-| Invalid JSON pre-ack failure is permanent | Same typed/wrapped PostgreSQL error classification |
-| Optional maximum `x-death` count | Optional maximum transport redelivery count |
-| Prefetch/QoS | Bounded pull batches and handler concurrency per subscription |
-| Gzip and large multi-payload chunks | Shared compressor and JSON wire envelope |
-| Independent publisher/subscriber resources | Two owned NATS connections |
+| Delayed automatic DLQ retry | Confirmed forwarding to the retry stream, with stored retry delay |
+| Rejected-handler `x-death` budget | Stored rejection count; connection loss does not spend it |
+| Dedicated dispatcher DLQ | Explicit confirmed forwarding before source acknowledgment/deletion |
+| Dispatcher message TTL | 20-second queued-assignment expiry; in-flight claims protect active delivery |
+| Queue inactivity expiry | 10-minute idle cleanup |
+| Auto-delete queue | Cleanup after the last subscriber leaves |
+| Immediately-expiring publication | Live Core NATS delivery with no offline backlog |
+| Prefetch/QoS | Bounded outstanding pulls and active hooks per subscription |
+| Gzip, chunking, tracing | Shared envelope/compressor and propagated trace carrier |
+| Clone and cleanup | Independent connections, shared namespace; cleanup joins active hooks |
 
-Queue names are SHA-256 encoded into stream and subject names. This preserves
-queue identity without interpreting queue names as NATS wildcards. The namespace
-prefix separates deployments sharing a NATS account.
+A pre-ack failure is retried through the queue's DLQ unless it is a permanent
+PostgreSQL invalid-JSON error. Malformed envelopes and invalid gzip follow the
+same rejection route. A post-ack failure is logged without redelivery. Automatic
+retry consumers use the same hooks as their primary queue. The optional rejection
+limit drops a message when its stored count exceeds the configured maximum.
 
-The stream uses `DiscardNew`, has no age expiry, and rejects new publications
-when its byte limit is reached. It does not evict unacknowledged backlog.
-Declarations fail on conflicting existing configurations instead of modifying
-them. Successful ACKs remove messages through WorkQueue retention.
+The durable queue and the engine's separate best-effort `PubSub` interface retain
+their distinct contracts. Selecting JetStream defaults `PubSub` to the existing
+Core NATS adapter, inheriting the JetStream URL/authentication/TLS settings.
+An explicitly configured pubsub backend or URL takes precedence. No RabbitMQ
+service is needed with that default. Pubsub remains at most once, as required by
+that separate interface; it is not a durable event log.
 
-Delivery is at least once. Uncertain publication or acknowledgment outcomes can
-produce retries; handlers must retain their existing idempotency behavior.
-`Message.ID` identifies a message kind and is deliberately not used as a
-`Nats-Msg-Id` deduplication key. A multi-chunk send can partially succeed before a
-transport failure, so retrying that send can duplicate earlier chunks.
+## Configuration
 
-A pre-ack failure receives delayed redelivery unless it is permanent. A
-post-ack failure is logged and does not request redelivery. As with RabbitMQ,
-permanently rejected/malformed messages are acknowledged and dropped. When the
-optional retry bound is enabled, it includes crash/ACK-timeout redeliveries as
-well as handler failures; this differs from RabbitMQ's `x-death` counter.
-
-## Supported boundary
-
-Ordinary durable queues, including the dispatcher **dead-letter** queue, are
-supported. Dispatcher destination queues, exclusive/non-durable/auto-deleted
-queues, expiring queues and immediately-expiring publications are rejected
-explicitly. No dispatcher message is silently stored with incorrect expiry
-semantics. The queue interface and existing engine callers are not changed.
-
-Next stages:
-
-1. Dispatcher ownership, queue inactivity, 20-second message expiry and explicit
-   delivery to the dispatcher DLQ, including unavailable-dispatcher recovery.
-2. Server configuration/loader integration and an intentional choice of the
-   separate best-effort pubsub backend.
-3. Full engine/SDK and multi-node quorum/failover checks before enabling it for
-   deployment.
-
-## Options
-
-`New` returns `(cleanup, backend, error)`, like RabbitMQ. `Clone` owns independent
-connections but addresses the same queue namespace; closing a clone does not
-close its parent. Subscription cleanup stops delivery and waits for active hooks.
-Hooks must return so cleanup can finish. `SetQOS` affects new subscriptions.
-
-| Option | Default |
-| --- | --- |
-| `WithURL` | Required |
-| `WithCredentials` | Optional; existing URL credentials also work |
-| `WithTLS` | Disabled; enabling uses TLS-first with system roots or supplied CA |
-| `WithStreamPrefix` | `HATCHET_MQ` |
-| `WithReplicas` | 3; use 1 for a single-node development broker |
-| `WithMaxBytes` | 1 GiB per stream |
-| `WithQos` | 100 |
-| `WithAckWait` | 5 minutes |
-| `WithRequestTimeout` | 5 seconds |
-| `WithDeadLetterBackoff` | 5 seconds |
-| `WithGzipCompression` | Disabled; threshold defaults to 5 KiB |
-| `WithMessageRejection` | Disabled; helper defaults to 5 retries if its limit is nonpositive |
-
-The broker must have JetStream enabled and `max_payload` at least 16 MiB, matching
-Hatchet's existing message-size contract. Stream byte limits and replica counts
-must fit the broker/account capacity. Separate deployments should use different
-prefixes. Default construction needs three available JetStream servers.
-
-## Tests
-
-Unit tests require no server:
+Single-broker development example:
 
 ```sh
-go test ./internal/msgqueue/jetstream
+export SERVER_MSGQUEUE_KIND=jetstream
+export SERVER_MSGQUEUE_JETSTREAM_URL=nats://127.0.0.1:4222
+export SERVER_MSGQUEUE_JETSTREAM_REPLICAS=1
 ```
 
-Run a dedicated test broker from the repository root:
+The broker must enable JetStream and `max_payload` of at least 16 MiB. The test
+configuration in `testdata/nats.conf` provides both. Production defaults require
+three available JetStream servers. Queue and KV replicas use the same setting.
+Use a separate stream prefix for each deployment sharing a NATS account.
+
+All options are available under `msgQueue.jetstream` in server configuration, or
+as environment variables prefixed `SERVER_MSGQUEUE_JETSTREAM_`:
+
+| Environment suffix | Default |
+| --- | --- |
+| `URL` | Required |
+| `USERNAME`, `PASSWORD` | Optional; URL credentials also work |
+| `TLS_ENABLED`, `TLS_ROOT_CA_FILE` | Disabled; TLS-first handshake, system or supplied roots |
+| `STREAM_PREFIX` | `HATCHET_MQ` |
+| `REPLICAS` | 3 |
+| `MAX_BYTES` | 1073741824 per queue |
+| `QOS` | 100 |
+| `COMPRESSION_ENABLED`, `COMPRESSION_THRESHOLD` | false, 5120 bytes |
+| `ENABLE_MESSAGE_REJECTION`, `MAX_DEATH_COUNT` | false, 1000 |
+| `ACK_WAIT` | 5m |
+| `REQUEST_TIMEOUT` | 5s |
+| `DEAD_LETTER_BACKOFF` | 5s |
+| `DISPATCHER_TTL` | 20s |
+| `INACTIVITY_TTL` | 10m |
+| `LEASE_TIMEOUT` | 15s |
+| `SWEEP_INTERVAL` | 1s |
+
+The library offers matching `With...` options. `WithMessageRejection` defaults to
+five when called with a nonpositive limit; the server passes its configured limit.
+`SetQOS` affects new subscriptions. Hooks must return for cleanup to finish.
+
+## Durability and operational differences
+
+Publication waits for a JetStream PubAck, and the post-ack hook runs only after
+confirmed acknowledgment. Streams use `DiscardNew`: a full stream rejects writes
+instead of evicting unacknowledged backlog. Conflicting queue declarations fail.
+Queue names are hashed into safe stream/subject names.
+
+Delivery is at least once. Publication/acknowledgment uncertainty and partial
+multi-chunk sends can produce duplicates. Forwarding uses a stable deduplication
+identity including the source publication timestamp, sequence and destination;
+this remains bounded by the broker's deduplication window. `Message.ID` identifies
+a message kind and is not used as a publication deduplication key. Handlers must
+keep their existing idempotency behavior.
+
+JetStream does not implement RabbitMQ's broker-native DLX, exclusive queue or
+queue-expiry policies. This backend uses three namespace KV buckets (`owners`,
+`claims`, `catalog`) and a renewable maintenance lease to implement those rules.
+Expiry forwarding requires a running backend and broker quorum. Expiration is
+asynchronous, scanned in bounded batches, and can lag the TTL during outages or
+large backlogs. Ownership recovery is bounded by lease expiry, not TCP disconnect
+detection. Per-generation consumers prevent stale acknowledgments from a previous
+exclusive owner from acknowledging the next generation's deliveries. As with
+other at-least-once workers, external handler side effects still need idempotency.
+
+Immediately-expiring messages use a live-only Core NATS subject and do not wait
+for durable storage. This models RabbitMQ's zero-TTL/no-backlog intent but does
+not reproduce its broker-side arbitration exactly. Nonpersistent publications
+on durable queues receive stronger storage durability than RabbitMQ's transient
+message flag. These are deliberate transport differences, not claims of identical
+broker internals.
+
+The three KV buckets are file-backed, have 64 MiB limits each, and require account
+capacity in addition to the per-queue limits. Keep timeout/expiry/replica settings
+consistent among processes sharing a namespace. The runtime database remains
+PostgreSQL; this change does not port Hatchet's database layer to CockroachDB.
+
+## Verification
 
 ```sh
+go test ./internal/msgqueue/... ./pkg/config/loader ./pkg/config/server
+
 docker run -d --name hatchet-jetstream-test \
   -p 127.0.0.1:4222:4222 \
   -v "$PWD/internal/msgqueue/jetstream/testdata/nats.conf:/etc/nats/nats.conf:ro" \
   nats:2.12.4 -c /etc/nats/nats.conf
-
 HATCHET_TEST_JETSTREAM_URL=nats://127.0.0.1:4222 \
 HATCHET_TEST_JETSTREAM_CONTAINER=hatchet-jetstream-test \
-  go test -tags integration -count=1 -timeout=180s ./internal/msgqueue/jetstream
-
+  go test -race -tags integration -count=1 -timeout=240s ./internal/msgqueue/jetstream
 docker rm -f -v hatchet-jetstream-test
 ```
 
-The optional container variable enables a test that restarts that broker. Use a
-dedicated test container: the test intentionally interrupts every client on it.
-Without the variable only that restart test is skipped. The suite uses unique
-stream prefixes and removes its streams after testing.
+`HATCHET_TEST_JETSTREAM_CONTAINER` enables an intentional restart; use a dedicated
+broker. Integration tests use unique namespaces and remove their streams and KV
+buckets. Coverage includes competing consumers, hook order, retries, permanent
+errors, rejection budgets, crash recovery, exclusive handover, expiry without a
+subscriber, in-flight expiry protection, idle/auto-delete cleanup, live-only
+messages, QoS, compression/chunking and full-stream rejection.
 
-Tests cover backlog across backend recreation, competing consumers, pre/post-ack
-ordering, delayed retries, permanent errors, retry limits, unacknowledged delivery
-after connection loss, QoS, compression/chunking, full-stream rejection without
-backlog eviction, malformed envelopes, unsupported flags, configuration conflicts,
-idempotent shutdown and optional broker restart. Run with `-race` where supported.
+Three-broker leader/quorum test (intentionally stops its managed containers):
+
+```sh
+docker compose -f internal/msgqueue/jetstream/testdata/cluster.compose.yaml up -d --wait
+HATCHET_TEST_JETSTREAM_CLUSTER_URLS=nats://127.0.0.1:19423,nats://127.0.0.1:19424,nats://127.0.0.1:19425 \
+  go test -tags integration -run TestMessageQueueReplicatedLeaderAndQuorumLoss -timeout=180s ./internal/msgqueue/jetstream
+docker compose -f internal/msgqueue/jetstream/testdata/cluster.compose.yaml down -v
+```
+
+Full engine/SDK smoke test on Linux, requiring Go, Node, npm, curl and Docker:
+
+```sh
+bash internal/msgqueue/jetstream/testdata/e2e/run.sh
+```
+
+It builds the current engine/admin/migrations, starts isolated PostgreSQL and NATS,
+and exercises 20 retried tasks, six concurrency-limited tasks, a DAG, event fanout,
+and durable sleep/event wait. It kills the engine during that wait, keeps the SDK
+worker alive, restarts with the same configuration keys and verifies completion.
+It disables the server security check/analytics, never publishes an image, removes
+its containers and prints the location of its temporary diagnostic files.
+Set `HATCHET_TEST_QUEUE_KIND=rabbitmq` to run the same SDK/restart scenario against
+RabbitMQ as a control. The focused GitHub workflow runs both backends, plus the
+JetStream adapter/race and cluster tests. SDK dependencies are locked to 1.34.0.
