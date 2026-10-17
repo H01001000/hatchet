@@ -1,0 +1,26 @@
+name: hatchet-jetstream-cluster-test
+
+x-broker: &broker
+  image: nats:2.12.4
+  volumes:
+    - ./nats.conf:/etc/nats/nats.conf:ro
+
+services:
+  a:
+    <<: *broker
+    container_name: hatchet-jetstream-cluster-a
+    command: ["-c", "/etc/nats/nats.conf", "-n", "js-a", "--cluster_name", "hatchet-test", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://b:6222,nats://c:6222", "--client_advertise", "127.0.0.1:19423"]
+    ports:
+      - "127.0.0.1:19423:4222"
+  b:
+    <<: *broker
+    container_name: hatchet-jetstream-cluster-b
+    command: ["-c", "/etc/nats/nats.conf", "-n", "js-b", "--cluster_name", "hatchet-test", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://a:6222,nats://c:6222", "--client_advertise", "127.0.0.1:19424"]
+    ports:
+      - "127.0.0.1:19424:4222"
+  c:
+    <<: *broker
+    container_name: hatchet-jetstream-cluster-c
+    command: ["-c", "/etc/nats/nats.conf", "-n", "js-c", "--cluster_name", "hatchet-test", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://a:6222,nats://b:6222", "--client_advertise", "127.0.0.1:19425"]
+    ports:
+      - "127.0.0.1:19425:4222"

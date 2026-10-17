@@ -1,0 +1,8 @@
+{
+  "name": "hatchet-jetstream-smoke-test",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hatchet-dev/typescript-sdk": "1.34.0"
+  }
+}
