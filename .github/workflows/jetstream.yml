@@ -1,0 +1,52 @@
+name: JetStream queue adapter
+
+on:
+  pull_request:
+    paths:
+      - "internal/msgqueue/**"
+      - "pkg/logger/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/jetstream.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  queue-adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HATCHET_TEST_JETSTREAM_URL: nats://127.0.0.1:4222
+      HATCHET_TEST_JETSTREAM_CONTAINER: hatchet-jetstream-test
+      SERVER_SECURITY_CHECK_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Start dedicated JetStream broker
+        run: |
+          docker run -d --name "$HATCHET_TEST_JETSTREAM_CONTAINER" \
+            -p 127.0.0.1:4222:4222 \
+            -v "$PWD/internal/msgqueue/jetstream/testdata/nats.conf:/etc/nats/nats.conf:ro" \
+            nats:2.12.4 -c /etc/nats/nats.conf
+          for attempt in $(seq 1 30); do
+            if docker logs "$HATCHET_TEST_JETSTREAM_CONTAINER" 2>&1 | grep -q "Server is ready"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$HATCHET_TEST_JETSTREAM_CONTAINER"
+          exit 1
+      - name: Message queue unit tests
+        run: go test -count=1 ./internal/msgqueue/...
+      - name: JetStream integration and race tests
+        run: go test -race -tags integration -count=1 -timeout=180s ./internal/msgqueue/jetstream
+      - name: Broker diagnostics
+        if: failure()
+        run: docker logs "$HATCHET_TEST_JETSTREAM_CONTAINER"
+      - name: Clean up broker
+        if: always()
+        run: docker rm -f -v "$HATCHET_TEST_JETSTREAM_CONTAINER"
