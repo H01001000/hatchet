@@ -33,15 +33,20 @@ func (q testQueue) IsAutoDLQ() bool     { return false }
 func TestValidateQueue(t *testing.T) {
 	require.NoError(t, validateQueue(msgqueue.TASK_PROCESSING_QUEUE))
 	require.NoError(t, validateQueue(msgqueue.DISPATCHER_DEAD_LETTER_QUEUE))
-	require.ErrorIs(t, validateQueue(msgqueue.QueueTypeFromDispatcherID(uuid.New())), ErrUnsupportedQueue)
+	require.NoError(t, validateQueue(msgqueue.QueueTypeFromDispatcherID(uuid.New())))
 	for _, q := range []testQueue{
 		{name: "temporary", nonDurable: true}, {name: "auto", auto: true},
 		{name: "exclusive", exclusive: true}, {name: "expiring", expirable: true},
 	} {
-		t.Run(q.name, func(t *testing.T) { require.ErrorIs(t, validateQueue(q), ErrUnsupportedQueue) })
+		t.Run(q.name, func(t *testing.T) { require.NoError(t, validateQueue(q)) })
 	}
 	require.Error(t, validateQueue(nil))
 	require.Error(t, validateQueue(testQueue{}))
+}
+
+func TestDispatcherDeadLetterViewsDeclareTheSamePhysicalQueue(t *testing.T) {
+	queue := msgqueue.QueueTypeFromDispatcherID(uuid.New())
+	require.Equal(t, describeQueue(msgqueue.DISPATCHER_DEAD_LETTER_QUEUE), describeQueue(queue.DLQ()))
 }
 
 func TestQueueNamesAreStableAndSubjectSafe(t *testing.T) {

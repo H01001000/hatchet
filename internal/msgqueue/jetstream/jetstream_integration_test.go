@@ -75,6 +75,9 @@ func newTestMessageQueue(t *testing.T, fs ...MessageQueueImplOpt) *integrationFi
 			}
 		}
 		require.NoError(t, lister.Err())
+		for _, suffix := range []string{"owners", "claims", "catalog"} {
+			require.NoError(t, admin.DeleteKeyValue(ctx, prefix+"_"+suffix))
+		}
 		nc.Close()
 	})
 	return f
@@ -114,7 +117,7 @@ func waitDrained(t *testing.T, f *integrationFixture, queue msgqueue.Queue) {
 		defer cancel()
 		stream, err := f.admin.Stream(ctx, name)
 		if err != nil {
-			return false
+			return (queue.IsExpirable() || queue.AutoDeleted()) && errors.Is(err, natsjs.ErrStreamNotFound)
 		}
 		info, err := stream.Info(ctx)
 		return err == nil && info.State.Msgs == 0
@@ -218,6 +221,7 @@ func TestMessageQueueRetryLimit(t *testing.T) {
 	}, msgqueue.NoOpHook)
 	require.NoError(t, f.q.SendMessage(t.Context(), queue, fixtureMessage(t, 1)))
 	waitDrained(t, f, queue)
+	waitDrained(t, f, queue.DLQ())
 	require.EqualValues(t, 2, calls.Load())
 }
 
@@ -345,7 +349,7 @@ func TestMessageQueueRejectsFullStreamWithoutEvictingBacklog(t *testing.T) {
 	require.EqualValues(t, 1, info.State.Msgs)
 }
 
-func TestMessageQueueMalformedEnvelopeAndUnsupportedSemantics(t *testing.T) {
+func TestMessageQueueMalformedEnvelopeAndInvalidHooks(t *testing.T) {
 	f := newTestMessageQueue(t)
 	queue := msgqueue.NewRandomStaticQueue()
 	state, err := f.q.initQueue(t.Context(), queue)
@@ -357,13 +361,9 @@ func TestMessageQueueMalformedEnvelopeAndUnsupportedSemantics(t *testing.T) {
 	waitDrained(t, f, queue)
 	require.Zero(t, calls.Load())
 
-	dispatcher := msgqueue.QueueTypeFromDispatcherID(uuid.New())
-	require.ErrorIs(t, f.q.SendMessage(t.Context(), dispatcher, fixtureMessage(t, 1)), ErrUnsupportedQueue)
-	_, err = f.q.Subscribe(dispatcher, msgqueue.NoOpHook, msgqueue.NoOpHook)
-	require.ErrorIs(t, err, ErrUnsupportedQueue)
 	msg := fixtureMessage(t, 2)
 	msg.ImmediatelyExpire = true
-	require.ErrorContains(t, f.q.SendMessage(t.Context(), queue, msg), "immediately-expire")
+	require.NoError(t, f.q.SendMessage(t.Context(), queue, msg))
 	_, err = f.q.Subscribe(queue, nil, msgqueue.NoOpHook)
 	require.Error(t, err)
 }

@@ -3,6 +3,7 @@ package jetstream
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5/pgconn"
 	natsgo "github.com/nats-io/nats.go"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/hatchet-dev/hatchet/internal/msgqueue"
 	"github.com/hatchet-dev/hatchet/pkg/logger"
+	"github.com/hatchet-dev/hatchet/pkg/telemetry"
 )
 
 const (
@@ -28,19 +31,17 @@ const (
 	defaultPrefix   = "HATCHET_MQ"
 )
 
-// ErrUnsupportedQueue identifies queue lifecycles that require dispatcher
-// expiry/rerouting or exclusive ownership, which this stage does not implement.
-var ErrUnsupportedQueue = errors.New("unsupported JetStream queue lifecycle")
-
 var streamPrefixPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 
 type queueState struct {
-	consumer natsjs.Consumer
-	subject  string
+	consumer   natsjs.Consumer
+	stream     natsjs.Stream
+	subject    string
+	definition queueDefinition
 }
 
 // MessageQueueImpl implements the durable MessageQueue interface using JetStream.
-// Each supported queue has a file-backed WorkQueue stream and a shared consumer.
+// Each queue has a WorkQueue stream and a competing-consumer delivery path.
 type MessageQueueImpl struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -62,6 +63,16 @@ type MessageQueueImpl struct {
 	compressor             msgqueue.Compressor
 	enableMessageRejection bool
 	maxDeathCount          uint64
+	identity               string
+	dispatcherTTL          time.Duration
+	inactivityTTL          time.Duration
+	leaseTimeout           time.Duration
+	sweepInterval          time.Duration
+	owners                 natsjs.KeyValue
+	claims                 natsjs.KeyValue
+	catalog                natsjs.KeyValue
+	maintenanceDone        chan struct{}
+	maintenanceCursor      map[string]uint64
 
 	queueMu sync.Mutex
 	queues  map[string]queueState
@@ -70,6 +81,7 @@ type MessageQueueImpl struct {
 	closed      bool
 	subs        map[*subscription]struct{}
 	closeOnce   sync.Once
+	supervisors sync.WaitGroup
 }
 
 var _ msgqueue.MessageQueue = (*MessageQueueImpl)(nil)
@@ -94,6 +106,10 @@ type MessageQueueImplOpts struct {
 	compressionThreshold   int
 	enableMessageRejection bool
 	maxDeathCount          uint64
+	dispatcherTTL          time.Duration
+	inactivityTTL          time.Duration
+	leaseTimeout           time.Duration
+	sweepInterval          time.Duration
 }
 
 func defaultMessageQueueImplOpts() *MessageQueueImplOpts {
@@ -103,6 +119,8 @@ func defaultMessageQueueImplOpts() *MessageQueueImplOpts {
 		maxBytes: 1 << 30, ackWait: consumerTimeout, requestTimeout: 5 * time.Second,
 		deadLetterBackoff: 5 * time.Second, maxDeathCount: 5,
 		compressionThreshold: msgqueue.DefaultCompressionThreshold,
+		dispatcherTTL:        20 * time.Second, inactivityTTL: 10 * time.Minute,
+		leaseTimeout: 15 * time.Second, sweepInterval: time.Second,
 	}
 }
 
@@ -160,6 +178,18 @@ func WithDeadLetterBackoff(backoff time.Duration) MessageQueueImplOpt {
 	return func(opts *MessageQueueImplOpts) { opts.deadLetterBackoff = backoff }
 }
 
+func WithDispatcherExpiry(messageTTL, inactivityTTL time.Duration) MessageQueueImplOpt {
+	return func(opts *MessageQueueImplOpts) { opts.dispatcherTTL, opts.inactivityTTL = messageTTL, inactivityTTL }
+}
+
+func WithLeaseTimeout(timeout time.Duration) MessageQueueImplOpt {
+	return func(opts *MessageQueueImplOpts) { opts.leaseTimeout = timeout }
+}
+
+func WithSweepInterval(interval time.Duration) MessageQueueImplOpt {
+	return func(opts *MessageQueueImplOpts) { opts.sweepInterval = interval }
+}
+
 func WithGzipCompression(enabled bool, threshold int) MessageQueueImplOpt {
 	return func(opts *MessageQueueImplOpts) {
 		opts.compressionEnabled = enabled
@@ -170,8 +200,8 @@ func WithGzipCompression(enabled bool, threshold int) MessageQueueImplOpt {
 	}
 }
 
-// WithMessageRejection bounds transport delivery attempts when enabled.
-// Unlike RabbitMQ's x-death counter, JetStream counts crash redeliveries too.
+// WithMessageRejection bounds rejected-handler attempts. A lost connection or
+// acknowledgment does not consume the rejection budget.
 func WithMessageRejection(enabled bool, maxDeathCount int) MessageQueueImplOpt {
 	return func(opts *MessageQueueImplOpts) {
 		opts.enableMessageRejection = enabled
@@ -202,6 +232,9 @@ func (opts *MessageQueueImplOpts) validate() error {
 	if opts.tlsRootCAFile != "" && !opts.tlsEnabled {
 		return errors.New("jetstream TLS root CA requires TLS to be enabled")
 	}
+	if opts.dispatcherTTL <= 0 || opts.inactivityTTL <= 0 || opts.sweepInterval <= 0 || opts.leaseTimeout < 3*opts.sweepInterval {
+		return errors.New("jetstream expiry intervals must be positive and lease timeout at least three sweep intervals")
+	}
 	return nil
 }
 
@@ -223,7 +256,10 @@ func New(fs ...MessageQueueImplOpt) (func() error, *MessageQueueImpl, error) {
 		connectOpts = append(connectOpts, natsgo.UserInfo(opts.username, opts.password))
 	}
 	if opts.tlsEnabled {
-		connectOpts = append(connectOpts, natsgo.TLSHandshakeFirst())
+		connectOpts = append(connectOpts,
+			natsgo.Secure(&tls.Config{MinVersion: tls.VersionTLS13}),
+			natsgo.TLSHandshakeFirst(),
+		)
 		if opts.tlsRootCAFile != "" {
 			connectOpts = append(connectOpts, natsgo.RootCAs(opts.tlsRootCAFile))
 		}
@@ -247,6 +283,9 @@ func New(fs ...MessageQueueImplOpt) (func() error, *MessageQueueImpl, error) {
 		compressor:             msgqueue.Compressor{Enabled: opts.compressionEnabled, Threshold: opts.compressionThreshold},
 		enableMessageRejection: opts.enableMessageRejection, maxDeathCount: opts.maxDeathCount,
 		queues: make(map[string]queueState), subs: make(map[*subscription]struct{}),
+		identity: uuid.NewString(), dispatcherTTL: opts.dispatcherTTL, inactivityTTL: opts.inactivityTTL,
+		leaseTimeout: opts.leaseTimeout, sweepInterval: opts.sweepInterval,
+		maintenanceCursor: make(map[string]uint64),
 	}
 	t.qos.Store(opts.qos)
 	if pubConn.MaxPayload() < msgqueue.MaxMessageSize || subConn.MaxPayload() < msgqueue.MaxMessageSize {
@@ -261,12 +300,18 @@ func New(fs ...MessageQueueImplOpt) (func() error, *MessageQueueImpl, error) {
 		_ = t.close()
 		return nil, nil, fmt.Errorf("create JetStream client: %w", err)
 	}
+	if err := t.initLifecycle(); err != nil {
+		_ = t.close()
+		return nil, nil, err
+	}
 	for _, q := range []msgqueue.Queue{msgqueue.TASK_PROCESSING_QUEUE, msgqueue.OLAP_QUEUE, msgqueue.DISPATCHER_DEAD_LETTER_QUEUE} {
 		if _, err := t.initQueue(ctx, q); err != nil {
 			_ = t.close()
 			return nil, nil, fmt.Errorf("initialize JetStream queue %q: %w", q.Name(), err)
 		}
 	}
+	t.maintenanceDone = make(chan struct{})
+	go t.maintainQueues()
 	return t.close, t, nil
 }
 
@@ -285,6 +330,10 @@ func (t *MessageQueueImpl) close() error {
 		}
 		for _, sub := range subs {
 			<-sub.done
+		}
+		t.supervisors.Wait()
+		if t.maintenanceDone != nil {
+			<-t.maintenanceDone
 		}
 		t.pubConn.Close()
 		t.subConn.Close()
@@ -312,9 +361,6 @@ func validateQueue(q msgqueue.Queue) error {
 	if q == nil || q.Name() == "" {
 		return errors.New("jetstream queue name must not be empty")
 	}
-	if !q.Durable() || q.AutoDeleted() || q.Exclusive() || q.IsExpirable() {
-		return fmt.Errorf("%w: queue %q requires non-durable, auto-delete, exclusive or expiring semantics", ErrUnsupportedQueue, q.Name())
-	}
 	return nil
 }
 
@@ -330,33 +376,51 @@ func (t *MessageQueueImpl) initQueue(ctx context.Context, q msgqueue.Queue) (que
 	}
 	t.queueMu.Lock()
 	defer t.queueMu.Unlock()
+	definition := describeQueue(q)
 	if state, ok := t.queues[q.Name()]; ok {
+		if state.definition != definition {
+			return queueState{}, fmt.Errorf("queue %q has a conflicting definition", q.Name())
+		}
 		return state, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, t.requestTimeout)
 	defer cancel()
 	name, subject := t.queueNames(q)
-	_, err := t.pubJS.CreateStream(ctx, natsjs.StreamConfig{
+	encoded, err := json.Marshal(definition)
+	if err != nil {
+		return queueState{}, err
+	}
+	storage := natsjs.FileStorage
+	if !q.Durable() {
+		storage = natsjs.MemoryStorage
+	}
+	stream, err := t.pubJS.CreateStream(ctx, natsjs.StreamConfig{
 		Name: name, Description: "Hatchet durable queue: " + q.Name(), Subjects: []string{subject},
-		Retention: natsjs.WorkQueuePolicy, Storage: natsjs.FileStorage, Replicas: t.replicas,
+		Retention: natsjs.WorkQueuePolicy, Storage: storage, Replicas: t.replicas,
 		Discard: natsjs.DiscardNew, MaxBytes: t.maxBytes, MaxMsgSize: msgqueue.MaxMessageSize,
+		Metadata: map[string]string{queueMetadataKey: string(encoded)},
 	})
 	if err != nil {
 		return queueState{}, fmt.Errorf("declare stream: %w", err)
 	}
-	consumer, err := t.subJS.CreateConsumer(ctx, name, natsjs.ConsumerConfig{
-		Durable: consumerName, FilterSubject: subject, AckPolicy: natsjs.AckExplicitPolicy,
-		AckWait: t.ackWait, MaxDeliver: -1, MaxAckPending: -1,
-	})
+	var consumer natsjs.Consumer
+	if !q.Exclusive() {
+		consumer, err = t.subJS.CreateConsumer(ctx, name, natsjs.ConsumerConfig{
+			Durable: consumerName, FilterSubject: subject, AckPolicy: natsjs.AckExplicitPolicy,
+			AckWait: t.ackWait, MaxDeliver: -1, MaxAckPending: -1,
+		})
+	}
 	if err != nil {
 		return queueState{}, fmt.Errorf("declare consumer: %w", err)
 	}
-	state := queueState{consumer: consumer, subject: subject}
+	state := queueState{consumer: consumer, stream: stream, subject: subject, definition: definition}
 	t.queues[q.Name()] = state
 	return state, nil
 }
 
 func (t *MessageQueueImpl) SendMessage(ctx context.Context, q msgqueue.Queue, msg *msgqueue.Message) error {
+	ctx, span := telemetry.NewSpan(ctx, "MessageQueueImpl.SendMessage")
+	defer span.End()
 	if err := t.ctx.Err(); err != nil {
 		return err
 	}
@@ -366,10 +430,22 @@ func (t *MessageQueueImpl) SendMessage(ctx context.Context, q msgqueue.Queue, ms
 	if err := validateQueue(q); err != nil {
 		return err
 	}
-	if msg == nil || msg.ImmediatelyExpire {
-		return errors.New("jetstream requires a message without immediately-expire semantics")
+	if msg == nil {
+		return errors.New("jetstream requires a message")
 	}
-	bodies, err := t.messageBodies(msg, int(t.pubConn.MaxPayload()))
+	msg = msg.Clone()
+	msg.SetOtelCarrier(telemetry.GetCarrier(ctx))
+	if q.IsExpirable() || q.AutoDeleted() {
+		gate, err := t.acquireGate(ctx, q)
+		if err != nil {
+			return err
+		}
+		defer gate.release()
+		ctx = gate.ctx
+		t.invalidateQueue(q.Name())
+	}
+	// Retry headers and the stable forwarding identity share the broker's wire limit.
+	bodies, err := t.messageBodies(msg, int(t.pubConn.MaxPayload())-1024)
 	if err != nil {
 		return err
 	}
@@ -379,9 +455,20 @@ func (t *MessageQueueImpl) SendMessage(ctx context.Context, q msgqueue.Queue, ms
 	}
 	for _, body := range bodies {
 		pubCtx, cancel := context.WithTimeout(ctx, t.requestTimeout)
-		_, err := t.pubJS.Publish(pubCtx, state.subject, body)
+		var err error
+		if msg.ImmediatelyExpire {
+			err = t.pubConn.Publish(state.subject+".live", body)
+			if err == nil {
+				err = t.pubConn.FlushWithContext(pubCtx)
+			}
+		} else {
+			_, err = t.pubJS.Publish(pubCtx, state.subject, body)
+		}
 		cancel()
 		if err != nil {
+			if errors.Is(err, natsjs.ErrNoStreamResponse) || errors.Is(err, natsjs.ErrStreamNotFound) {
+				t.invalidateQueue(q.Name())
+			}
 			return fmt.Errorf("publish to queue %q: %w", q.Name(), err)
 		}
 	}
@@ -429,42 +516,167 @@ func (t *MessageQueueImpl) messageBodies(msg *msgqueue.Message, maxPayload int) 
 }
 
 type subscription struct {
-	cancel context.CancelFunc
-	iter   natsjs.MessagesContext
-	done   chan struct{}
-	once   sync.Once
+	cancel       context.CancelFunc
+	done         chan struct{}
+	once         sync.Once
+	live         *natsgo.Subscription
+	liveMu       sync.Mutex
+	stopped      bool
+	liveHandlers sync.WaitGroup
+	handlerSlots chan struct{}
 }
 
 func (s *subscription) stop() {
 	s.once.Do(func() {
+		s.liveMu.Lock()
+		s.stopped = true
+		s.liveMu.Unlock()
 		s.cancel()
-		s.iter.Stop()
+		if s.live != nil {
+			_ = s.live.Unsubscribe()
+		}
 	})
 }
 
 func (t *MessageQueueImpl) Subscribe(q msgqueue.Queue, preAck, postAck msgqueue.MsgHandler) (func() error, error) {
-	if preAck == nil || postAck == nil {
-		return nil, errors.New("jetstream requires both preAck and postAck hooks")
-	}
-	state, err := t.initQueue(t.ctx, q)
+	cleanup, err := t.subscribe(q, q, preAck, postAck)
 	if err != nil {
 		return nil, err
 	}
-	qos := int(t.qos.Load())
-	iter, err := state.consumer.Messages(natsjs.PullMaxMessages(qos))
-	if err != nil {
-		return nil, fmt.Errorf("subscribe to queue %q: %w", q.Name(), err)
+	if dlq := q.DLQ(); dlq != nil && dlq.IsAutoDLQ() {
+		cleanupDLQ, err := t.subscribe(dlq, q, preAck, postAck)
+		if err != nil {
+			_ = cleanup()
+			return nil, err
+		}
+		return func() error { return errors.Join(cleanup(), cleanupDLQ()) }, nil
 	}
+	return cleanup, nil
+}
+
+func (t *MessageQueueImpl) subscribe(q, root msgqueue.Queue, preAck, postAck msgqueue.MsgHandler) (func() error, error) {
 	ctx, cancel := context.WithCancel(t.ctx)
-	sub := &subscription{cancel: cancel, iter: iter, done: make(chan struct{})}
+	t.lifecycleMu.Lock()
+	if t.closed {
+		t.lifecycleMu.Unlock()
+		cancel()
+		return nil, errors.New("jetstream backend is closed")
+	}
+	t.supervisors.Add(1)
+	t.lifecycleMu.Unlock()
+	first, err := t.startSubscription(ctx, q, root, preAck, postAck)
+	if err != nil {
+		cancel()
+		t.supervisors.Done()
+		return nil, err
+	}
+	done := make(chan struct{})
+	go func() {
+		defer t.supervisors.Done()
+		defer close(done)
+		current := first
+		for {
+			if current != nil {
+				select {
+				case <-ctx.Done():
+					current.stop()
+					<-current.done
+					return
+				case <-current.done:
+					current = nil
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(t.sweepInterval):
+			}
+			var err error
+			current, err = t.startSubscription(ctx, q, root, preAck, postAck)
+			if err != nil {
+				t.l.Warn().Err(err).Str("queue", q.Name()).Msg("retrying JetStream subscription")
+			}
+		}
+	}()
+	return func() error { cancel(); <-done; return nil }, nil
+}
+
+func (t *MessageQueueImpl) startSubscription(parent context.Context, q, root msgqueue.Queue, preAck, postAck msgqueue.MsgHandler) (*subscription, error) {
+	if preAck == nil || postAck == nil {
+		return nil, errors.New("jetstream requires both preAck and postAck hooks")
+	}
+	gate, err := t.acquireGate(parent, q)
+	if err != nil {
+		return nil, err
+	}
+	defer gate.release()
+	t.invalidateQueue(q.Name())
+	state, err := t.initQueue(gate.ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := t.acquireSubscription(gate.ctx, state)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.markSubscribed(gate.ctx, state); err != nil {
+		lease.release()
+		return nil, err
+	}
+	if q.Exclusive() {
+		state.consumer, err = t.exclusiveConsumer(gate.ctx, state, lease)
+		if err != nil {
+			lease.release()
+			return nil, err
+		}
+	}
+	qos := int(t.qos.Load())
+	ctx, cancel := context.WithCancel(parent)
+	sub := &subscription{cancel: cancel, done: make(chan struct{}), handlerSlots: make(chan struct{}, qos)}
+	live, err := t.subConn.QueueSubscribe(state.subject+".live", state.subject, func(raw *natsgo.Msg) {
+		sub.liveMu.Lock()
+		if sub.stopped {
+			sub.liveMu.Unlock()
+			return
+		}
+		sub.liveHandlers.Add(1)
+		sub.liveMu.Unlock()
+		defer sub.liveHandlers.Done()
+		select {
+		case sub.handlerSlots <- struct{}{}:
+			defer func() { <-sub.handlerSlots }()
+		case <-ctx.Done():
+			return
+		}
+		t.handleLive(ctx, q, root, raw, preAck, postAck)
+	})
+	if err != nil {
+		sub.stop()
+		lease.release()
+		return nil, err
+	}
+	sub.live = live
+	flushCtx, flushCancel := context.WithTimeout(ctx, t.requestTimeout)
+	flushErr := t.subConn.FlushWithContext(flushCtx)
+	flushCancel()
+	if flushErr != nil {
+		sub.stop()
+		lease.release()
+		return nil, flushErr
+	}
 	t.lifecycleMu.Lock()
 	if t.closed {
 		t.lifecycleMu.Unlock()
 		sub.stop()
+		lease.release()
 		return nil, errors.New("jetstream backend is closed")
 	}
 	t.subs[sub] = struct{}{}
 	t.lifecycleMu.Unlock()
+	lease.renew(ctx, sub.stop)
 	go func() {
 		defer close(sub.done)
 		defer func() {
@@ -472,9 +684,8 @@ func (t *MessageQueueImpl) Subscribe(q msgqueue.Queue, preAck, postAck msgqueue.
 			delete(t.subs, sub)
 			t.lifecycleMu.Unlock()
 		}()
-		defer sub.stop()
 		var handlers sync.WaitGroup
-		defer handlers.Wait()
+		defer func() { sub.stop(); handlers.Wait(); sub.liveHandlers.Wait(); lease.release() }()
 		slots := make(chan struct{}, qos)
 		for {
 			select {
@@ -482,64 +693,126 @@ func (t *MessageQueueImpl) Subscribe(q msgqueue.Queue, preAck, postAck msgqueue.
 			case <-ctx.Done():
 				return
 			}
-			delivery, err := iter.Next()
+			reserved := 1
+		reserve:
+			for reserved < qos {
+				select {
+				case slots <- struct{}{}:
+					reserved++
+				default:
+					break reserve
+				}
+			}
+			batch, err := state.consumer.Fetch(reserved, natsjs.FetchMaxWait(250*time.Millisecond))
 			if err != nil {
-				<-slots
-				if ctx.Err() != nil || errors.Is(err, natsjs.ErrMsgIteratorClosed) {
+				for range reserved {
+					<-slots
+				}
+				if ctx.Err() != nil {
 					return
 				}
-				t.l.Error().Err(err).Str("queue", q.Name()).Msg("error receiving JetStream message")
-				continue
+				t.l.Warn().Err(err).Msg("JetStream pull failed")
+				return
 			}
-			handlers.Add(1)
-			go func() {
-				defer handlers.Done()
-				defer func() { <-slots }()
-				t.handleMessage(ctx, delivery, preAck, postAck)
-			}()
+			received := 0
+			for delivery := range batch.Messages() {
+				received++
+				if ctx.Err() != nil {
+					<-slots
+					continue
+				}
+				select {
+				case sub.handlerSlots <- struct{}{}:
+				case <-ctx.Done():
+					<-slots
+					continue
+				}
+				handlers.Add(1)
+				go func() {
+					defer handlers.Done()
+					defer func() { <-slots }()
+					defer func() { <-sub.handlerSlots }()
+					t.handleMessage(ctx, delivery, q, root, lease.key, preAck, postAck)
+				}()
+			}
+			for i := received; i < reserved; i++ {
+				<-slots
+			}
+			if err := batch.Error(); err != nil && !errors.Is(err, natsgo.ErrTimeout) && !errors.Is(err, natsjs.ErrNoMessages) {
+				if ctx.Err() != nil {
+					return
+				}
+				t.l.Warn().Err(err).Msg("JetStream pull interrupted")
+				return
+			}
 		}
 	}()
-	return func() error {
-		sub.stop()
-		<-sub.done
-		return nil
-	}, nil
+	return sub, nil
 }
 
-func (t *MessageQueueImpl) handleMessage(ctx context.Context, delivery natsjs.Msg, preAck, postAck msgqueue.MsgHandler) {
+func (t *MessageQueueImpl) handleMessage(ctx context.Context, delivery natsjs.Msg, q, root msgqueue.Queue, ownerKey string, preAck, postAck msgqueue.MsgHandler) {
 	metadata, err := delivery.Metadata()
 	if err != nil {
 		t.l.Error().Err(err).Msg("could not read JetStream delivery metadata")
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
+	if readyAfter(delivery.Headers(), metadata.Timestamp).After(time.Now()) {
+		_ = delivery.NakWithDelay(time.Until(readyAfter(delivery.Headers(), metadata.Timestamp)))
+		return
+	}
+	if q.IsExpirable() {
+		claim, err := t.claimMessage(ctx, stateKey(t, q, metadata.Sequence.Stream, metadata.Timestamp), ownerKey, false)
+		if err != nil {
+			_ = delivery.NakWithDelay(t.sweepInterval)
+			return
+		}
+		defer claim.release()
+		if time.Since(metadata.Timestamp) >= t.dispatcherTTL {
+			if err := t.forward(ctx, q, root.DLQ(), delivery.Data(), delivery.Headers(), messageSource(metadata.Stream, metadata.Timestamp), metadata.Sequence.Stream, false); err == nil {
+				t.ack(ctx, delivery)
+			}
+			return
+		}
+	}
+	if t.enableMessageRejection && deathCount(delivery.Headers()) > t.maxDeathCount {
+		t.l.Error().Uint64("death_count", deathCount(delivery.Headers())).Msg("dropping message after maximum rejected deliveries")
+		t.ack(ctx, delivery)
+		return
+	}
 	msg := &msgqueue.Message{}
 	if err := json.Unmarshal(delivery.Data(), msg); err != nil {
 		t.l.Error().Err(err).Msg("dropping malformed JetStream message")
-		t.ack(ctx, delivery)
+		if err := t.retryMessage(ctx, q, root, delivery, metadata); err == nil {
+			t.ack(ctx, delivery)
+		}
 		return
 	}
 	if msg.Compressed {
 		payloads, err := msgqueue.DecompressPayloads(msg.Payloads)
 		if err != nil {
 			t.l.Error().Err(err).Msg("dropping invalid compressed JetStream message")
-			t.ack(ctx, delivery)
+			if err := t.retryMessage(ctx, q, root, delivery, metadata); err == nil {
+				t.ack(ctx, delivery)
+			}
 			return
 		}
 		msg.Payloads, msg.Compressed = payloads, false
 	}
-	if t.enableMessageRejection && metadata.NumDelivered > t.maxDeathCount+1 {
-		t.l.Error().Uint64("delivery_count", metadata.NumDelivered).Msg("dropping message after maximum transport retries")
-		t.ack(ctx, delivery)
-		return
-	}
+	ctx, span := telemetry.NewSpanWithCarrier(ctx, "handle_message", msg.OtelCarrier)
+	defer span.End()
 	if err := preAck(msg); err != nil {
 		if isPermanentPreAckError(err) {
 			t.l.Error().Err(err).Msg("dropping message due to permanent pre-ack error")
 			t.ack(ctx, delivery)
 			return
 		}
-		if err := delivery.NakWithDelay(t.deadLetterBackoff); err != nil {
-			t.l.Error().Err(err).Msg("could not delay JetStream redelivery")
+		if err := t.retryMessage(ctx, q, root, delivery, metadata); err == nil {
+			t.ack(ctx, delivery)
+		} else {
+			_ = delivery.NakWithDelay(t.deadLetterBackoff)
 		}
 		return
 	}
