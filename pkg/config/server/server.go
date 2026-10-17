@@ -565,11 +565,13 @@ type ConfigFileAuthCookie struct {
 type MessageQueueConfigFile struct {
 	Enabled bool `mapstructure:"enabled" json:"enabled,omitempty" default:"true"`
 
-	Kind string `mapstructure:"kind" json:"kind,omitempty" validate:"required,oneof=rabbitmq postgres" default:"rabbitmq"`
+	Kind string `mapstructure:"kind" json:"kind,omitempty" validate:"required,oneof=rabbitmq postgres jetstream" default:"rabbitmq"`
 
 	Postgres PostgresMQConfigFile `mapstructure:"postgres" json:"postgres,omitempty"`
 
 	RabbitMQ RabbitMQConfigFile `mapstructure:"rabbitmq" json:"rabbitmq,omitempty" validate:"required"`
+
+	JetStream JetStreamConfigFile `mapstructure:"jetstream" json:"jetstream,omitempty"`
 
 	PubSub PubSubConfigFile `mapstructure:"pubSub" json:"pubSub,omitempty"`
 }
@@ -642,6 +644,29 @@ type RabbitMQConfigFile struct {
 	CompressionThreshold   int    `mapstructure:"compressionThreshold" json:"compressionThreshold,omitempty" default:"5120"`
 	EnableMessageRejection bool   `mapstructure:"enableMessageRejection" json:"enableMessageRejection,omitempty" default:"false"`
 	MaxDeathCount          int    `mapstructure:"maxDeathCount" json:"maxDeathCount,omitempty" default:"1000"`
+}
+
+type JetStreamConfigFile struct {
+	URL                    string        `mapstructure:"url" json:"url,omitempty"`
+	Username               string        `mapstructure:"username" json:"username,omitempty"`
+	Password               string        `mapstructure:"password" json:"password,omitempty"`
+	TLSEnabled             bool          `mapstructure:"tlsEnabled" json:"tlsEnabled,omitempty"`
+	TLSRootCAFile          string        `mapstructure:"tlsRootCAFile" json:"tlsRootCAFile,omitempty"`
+	StreamPrefix           string        `mapstructure:"streamPrefix" json:"streamPrefix,omitempty" default:"HATCHET_MQ"`
+	Replicas               int           `mapstructure:"replicas" json:"replicas,omitempty" default:"3"`
+	MaxBytes               int64         `mapstructure:"maxBytes" json:"maxBytes,omitempty" default:"1073741824"`
+	Qos                    int           `mapstructure:"qos" json:"qos,omitempty" default:"100"`
+	CompressionEnabled     bool          `mapstructure:"compressionEnabled" json:"compressionEnabled,omitempty" default:"false"`
+	CompressionThreshold   int           `mapstructure:"compressionThreshold" json:"compressionThreshold,omitempty" default:"5120"`
+	EnableMessageRejection bool          `mapstructure:"enableMessageRejection" json:"enableMessageRejection,omitempty" default:"false"`
+	MaxDeathCount          int           `mapstructure:"maxDeathCount" json:"maxDeathCount,omitempty" default:"1000"`
+	AckWait                time.Duration `mapstructure:"ackWait" json:"ackWait,omitempty" default:"5m"`
+	RequestTimeout         time.Duration `mapstructure:"requestTimeout" json:"requestTimeout,omitempty" default:"5s"`
+	DeadLetterBackoff      time.Duration `mapstructure:"deadLetterBackoff" json:"deadLetterBackoff,omitempty" default:"5s"`
+	DispatcherTTL          time.Duration `mapstructure:"dispatcherTTL" json:"dispatcherTTL,omitempty" default:"20s"`
+	InactivityTTL          time.Duration `mapstructure:"inactivityTTL" json:"inactivityTTL,omitempty" default:"10m"`
+	LeaseTimeout           time.Duration `mapstructure:"leaseTimeout" json:"leaseTimeout,omitempty" default:"15s"`
+	SweepInterval          time.Duration `mapstructure:"sweepInterval" json:"sweepInterval,omitempty" default:"1s"`
 }
 
 type ConfigFileEmail struct {
@@ -993,6 +1018,26 @@ func BindAllEnv(v *viper.Viper) {
 
 	// throughput options
 	_ = v.BindEnv("msgQueue.rabbitmq.qos", "SERVER_MSGQUEUE_RABBITMQ_QOS")
+	_ = v.BindEnv("msgQueue.jetstream.url", "SERVER_MSGQUEUE_JETSTREAM_URL")
+	_ = v.BindEnv("msgQueue.jetstream.username", "SERVER_MSGQUEUE_JETSTREAM_USERNAME")
+	_ = v.BindEnv("msgQueue.jetstream.password", "SERVER_MSGQUEUE_JETSTREAM_PASSWORD")
+	_ = v.BindEnv("msgQueue.jetstream.tlsEnabled", "SERVER_MSGQUEUE_JETSTREAM_TLS_ENABLED")
+	_ = v.BindEnv("msgQueue.jetstream.tlsRootCAFile", "SERVER_MSGQUEUE_JETSTREAM_TLS_ROOT_CA_FILE")
+	_ = v.BindEnv("msgQueue.jetstream.streamPrefix", "SERVER_MSGQUEUE_JETSTREAM_STREAM_PREFIX")
+	_ = v.BindEnv("msgQueue.jetstream.replicas", "SERVER_MSGQUEUE_JETSTREAM_REPLICAS")
+	_ = v.BindEnv("msgQueue.jetstream.maxBytes", "SERVER_MSGQUEUE_JETSTREAM_MAX_BYTES")
+	_ = v.BindEnv("msgQueue.jetstream.qos", "SERVER_MSGQUEUE_JETSTREAM_QOS")
+	_ = v.BindEnv("msgQueue.jetstream.compressionEnabled", "SERVER_MSGQUEUE_JETSTREAM_COMPRESSION_ENABLED")
+	_ = v.BindEnv("msgQueue.jetstream.compressionThreshold", "SERVER_MSGQUEUE_JETSTREAM_COMPRESSION_THRESHOLD")
+	_ = v.BindEnv("msgQueue.jetstream.enableMessageRejection", "SERVER_MSGQUEUE_JETSTREAM_ENABLE_MESSAGE_REJECTION")
+	_ = v.BindEnv("msgQueue.jetstream.maxDeathCount", "SERVER_MSGQUEUE_JETSTREAM_MAX_DEATH_COUNT")
+	_ = v.BindEnv("msgQueue.jetstream.ackWait", "SERVER_MSGQUEUE_JETSTREAM_ACK_WAIT")
+	_ = v.BindEnv("msgQueue.jetstream.requestTimeout", "SERVER_MSGQUEUE_JETSTREAM_REQUEST_TIMEOUT")
+	_ = v.BindEnv("msgQueue.jetstream.deadLetterBackoff", "SERVER_MSGQUEUE_JETSTREAM_DEAD_LETTER_BACKOFF")
+	_ = v.BindEnv("msgQueue.jetstream.dispatcherTTL", "SERVER_MSGQUEUE_JETSTREAM_DISPATCHER_TTL")
+	_ = v.BindEnv("msgQueue.jetstream.inactivityTTL", "SERVER_MSGQUEUE_JETSTREAM_INACTIVITY_TTL")
+	_ = v.BindEnv("msgQueue.jetstream.leaseTimeout", "SERVER_MSGQUEUE_JETSTREAM_LEASE_TIMEOUT")
+	_ = v.BindEnv("msgQueue.jetstream.sweepInterval", "SERVER_MSGQUEUE_JETSTREAM_SWEEP_INTERVAL")
 
 	// pub/sub (all optional: inherit from the durable msgQueue settings when unset)
 	_ = v.BindEnv("msgQueue.pubSub.kind", "SERVER_MSGQUEUE_PUBSUB_KIND")

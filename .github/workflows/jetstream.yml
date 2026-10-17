@@ -1,0 +1,87 @@
+name: JetStream queue adapter
+
+on:
+  pull_request:
+    paths:
+      - "internal/msgqueue/**"
+      - "pkg/logger/**"
+      - "pkg/config/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/jetstream.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  queue-adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      HATCHET_TEST_JETSTREAM_URL: nats://127.0.0.1:4222
+      HATCHET_TEST_JETSTREAM_CONTAINER: hatchet-jetstream-test
+      SERVER_SECURITY_CHECK_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Start dedicated JetStream broker
+        run: |
+          docker run -d --name "$HATCHET_TEST_JETSTREAM_CONTAINER" \
+            -p 127.0.0.1:4222:4222 \
+            -v "$PWD/internal/msgqueue/jetstream/testdata/nats.conf:/etc/nats/nats.conf:ro" \
+            nats:2.12.4 -c /etc/nats/nats.conf
+          for attempt in $(seq 1 30); do
+            if docker logs "$HATCHET_TEST_JETSTREAM_CONTAINER" 2>&1 | grep -q "Server is ready"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$HATCHET_TEST_JETSTREAM_CONTAINER"
+          exit 1
+      - name: Message queue unit tests
+        run: go test -count=1 ./internal/msgqueue/... ./pkg/config/loader ./pkg/config/server
+      - name: JetStream integration and race tests
+        run: go test -race -tags integration -count=1 -timeout=240s ./internal/msgqueue/jetstream
+      - name: Start three-broker quorum test cluster
+        run: docker compose -f internal/msgqueue/jetstream/testdata/cluster.compose.yaml up -d --wait
+      - name: Replicated leader and quorum-loss test
+        env:
+          HATCHET_TEST_JETSTREAM_CLUSTER_URLS: nats://127.0.0.1:19423,nats://127.0.0.1:19424,nats://127.0.0.1:19425
+        run: |
+          sleep 5
+          go test -race -tags integration -count=1 -run TestMessageQueueReplicatedLeaderAndQuorumLoss -timeout=180s ./internal/msgqueue/jetstream
+      - name: Broker diagnostics
+        if: failure()
+        run: |
+          docker logs "$HATCHET_TEST_JETSTREAM_CONTAINER"
+          docker compose -f internal/msgqueue/jetstream/testdata/cluster.compose.yaml logs
+      - name: Clean up broker
+        if: always()
+        run: |
+          docker rm -f -v "$HATCHET_TEST_JETSTREAM_CONTAINER"
+          docker compose -f internal/msgqueue/jetstream/testdata/cluster.compose.yaml down -v
+
+  engine-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        queue: [jetstream, rabbitmq]
+    env:
+      GOMAXPROCS: "4"
+      SERVER_SECURITY_CHECK_ENABLED: "false"
+      HATCHET_TEST_QUEUE_KIND: ${{ matrix.queue }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: SDK workflows and engine crash recovery
+        run: bash internal/msgqueue/jetstream/testdata/e2e/run.sh

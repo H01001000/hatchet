@@ -53,6 +53,7 @@ import (
 	"github.com/hatchet-dev/hatchet/pkg/validator"
 
 	"github.com/hatchet-dev/hatchet/internal/msgqueue"
+	jsmq "github.com/hatchet-dev/hatchet/internal/msgqueue/jetstream"
 	natsmq "github.com/hatchet-dev/hatchet/internal/msgqueue/nats"
 	pgmq "github.com/hatchet-dev/hatchet/internal/msgqueue/postgres"
 	"github.com/hatchet-dev/hatchet/internal/msgqueue/rabbitmq"
@@ -597,6 +598,23 @@ func createControllerLayer(dc *database.Layer, cf *server.ServerConfigFile, vers
 			cleanup1 = func() error {
 				return cleanupv1()
 			}
+		case "jetstream":
+			cfg := cf.MessageQueue.JetStream
+			var cleanupv1 func() error
+			cleanupv1, mqv1, err = jsmq.New(
+				jsmq.WithURL(cfg.URL), jsmq.WithLogger(&l), jsmq.WithCredentials(cfg.Username, cfg.Password),
+				jsmq.WithTLS(cfg.TLSEnabled, cfg.TLSRootCAFile), jsmq.WithStreamPrefix(cfg.StreamPrefix),
+				jsmq.WithQos(cfg.Qos), jsmq.WithReplicas(cfg.Replicas), jsmq.WithMaxBytes(cfg.MaxBytes),
+				jsmq.WithGzipCompression(cfg.CompressionEnabled, cfg.CompressionThreshold),
+				jsmq.WithMessageRejection(cfg.EnableMessageRejection, cfg.MaxDeathCount),
+				jsmq.WithAckWait(cfg.AckWait), jsmq.WithRequestTimeout(cfg.RequestTimeout),
+				jsmq.WithDeadLetterBackoff(cfg.DeadLetterBackoff), jsmq.WithDispatcherExpiry(cfg.DispatcherTTL, cfg.InactivityTTL),
+				jsmq.WithLeaseTimeout(cfg.LeaseTimeout), jsmq.WithSweepInterval(cfg.SweepInterval),
+			)
+			if err != nil {
+				return nil, nil, fmt.Errorf("could not init JetStream queue: %w", err)
+			}
+			cleanup1 = cleanupv1
 		}
 
 		cleanupPubSub, pubsubv1, err = createPubSubV1(dc, cf, &l)
@@ -1103,7 +1121,8 @@ func createPubSubV1(dc *database.Layer, cf *server.ServerConfigFile, l *zerolog.
 		ps = rmqps
 		cleanup = cleanupRmq
 	case "nats":
-		natsURL := cf.MessageQueue.PubSub.NATS.URL
+		natsConfig := resolveNATSPubSubConfig(cf)
+		natsURL := natsConfig.URL
 
 		if natsURL == "" {
 			return nil, nil, fmt.Errorf("using NATS as pubsub requires a URL to be set")
@@ -1111,11 +1130,11 @@ func createPubSubV1(dc *database.Layer, cf *server.ServerConfigFile, l *zerolog.
 
 		cleanupNats, natsps, err := natsmq.NewPubSub(
 			natsmq.WithPubSubURL(natsURL),
-			natsmq.WithPubSubUsername(cf.MessageQueue.PubSub.NATS.Username),
-			natsmq.WithPubSubPassword(cf.MessageQueue.PubSub.NATS.Password),
-			natsmq.WithPubSubTLSEnabled(cf.MessageQueue.PubSub.NATS.TLSEnabled),
-			natsmq.WithPubSubTLSRootCAFile(cf.MessageQueue.PubSub.NATS.TLSRootCAFile),
-			natsmq.WithPubSubSubjectPrefix(cf.MessageQueue.PubSub.NATS.SubjectPrefix),
+			natsmq.WithPubSubUsername(natsConfig.Username),
+			natsmq.WithPubSubPassword(natsConfig.Password),
+			natsmq.WithPubSubTLSEnabled(natsConfig.TLSEnabled),
+			natsmq.WithPubSubTLSRootCAFile(natsConfig.TLSRootCAFile),
+			natsmq.WithPubSubSubjectPrefix(natsConfig.SubjectPrefix),
 			natsmq.WithPubSubLogger(l),
 		)
 
@@ -1142,6 +1161,9 @@ func resolvePubSubKindAndURL(cf *server.ServerConfigFile) (kind string, rabbitUR
 
 	if kind == "" {
 		kind = cf.MessageQueue.Kind
+		if strings.EqualFold(kind, "jetstream") {
+			kind = "nats"
+		}
 	}
 
 	rabbitURL = cf.MessageQueue.PubSub.RabbitMQ.URL
@@ -1151,6 +1173,27 @@ func resolvePubSubKindAndURL(cf *server.ServerConfigFile) (kind string, rabbitUR
 	}
 
 	return kind, rabbitURL
+}
+
+func resolveNATSPubSubConfig(cf *server.ServerConfigFile) server.PubSubNATSConfigFile {
+	cfg := cf.MessageQueue.PubSub.NATS
+	if strings.EqualFold(cf.MessageQueue.Kind, "jetstream") && cfg.URL == "" {
+		js := cf.MessageQueue.JetStream
+		cfg.URL = js.URL
+		if cfg.Username == "" {
+			cfg.Username = js.Username
+		}
+		if cfg.Password == "" {
+			cfg.Password = js.Password
+		}
+		if !cfg.TLSEnabled {
+			cfg.TLSEnabled = js.TLSEnabled
+		}
+		if cfg.TLSRootCAFile == "" {
+			cfg.TLSRootCAFile = js.TLSRootCAFile
+		}
+	}
+	return cfg
 }
 
 func getStrArr(v string) []string {
@@ -1407,7 +1450,6 @@ func setPgxApplicationName(config *pgxpool.Config, appName string) {
 func newOTelPgxTracer() *otelpgx.Tracer {
 	return otelpgx.NewTracer(
 		otelpgx.WithDisableSQLStatementInAttributes(),
-		otelpgx.WithTrimSQLInSpanName(),
 		otelpgx.WithSpanNameFunc(sqlcSpanName),
 	)
 }
